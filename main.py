@@ -2,12 +2,13 @@ import json
 import asyncio 
 import os
 import boto3
-from typing import AsyncGenerator
+import random
+
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+#from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from langchain_aws import ChatBedrock
@@ -38,6 +39,23 @@ bedrock_client = boto3.client(
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
 )
 
+#
+# Nombres aleatorios para los clientes
+client_names = ["Carlos Martinez", "Ana García", "Luis Rodríguez", "Marta López", "Jorge Hernández", "Sofía Martínez", "Pedro González", "Lucía Sánchez"]
+
+# Bases de datos de simulacion
+incidents = [
+    "El servidor de correo no sincroniza y estoy perdiendo ventas.",
+    "La VPN me desconecta cada 10 minutos y tengo una presentación en 1 hora.",
+    "Mi pantalla se puso azul y perdí el informe trimestral no guardado."
+]
+
+personalities = [
+    "AGRESIVO: Gritas (en mayúsculas a veces), amenazas con llamar al supervisor, no entiendes razones técnicas.",
+    "ASUSTADO: Crees que te van a despedir por esto, estás en pánico, pides ayuda desesperadamente.",
+    "SARCÁSTICO: Te burlas de la competencia de TI, haces comentarios pasivo-agresivos, eres impaciente."
+]
+
 # System prompt: AI role
 SYSTEM_PROMPT = """Eres un cliente que llama a soporte técnico.
 Estás frustrado porque llevas tiempo con un problema sin resolver.
@@ -48,6 +66,9 @@ Problema actual: No puedes acceder a tu correo corporativo desde ayer."""
 
 # Limit of history messages to keep in context
 MAX_HISTORY_TURNS = 20 # 20 for users / assistants, 40 for system messages
+
+#Delay artificial
+TYPING_DELAY = 2.0
 
 # Pydantic model
 
@@ -60,6 +81,10 @@ class ChatRequest(BaseModel):
     # This part allow change the system prompt since from the frontend
     system: str | None = None
 
+class ChatResponse(BaseModel):
+    message: str
+    system: str
+
 # Initialize the Bedrock model
 def get_llm() -> ChatBedrock:
     """Initialize the Bedrock model with the specified parameters."""
@@ -70,10 +95,46 @@ def get_llm() -> ChatBedrock:
             "temperature": 0.8,
             "max_tokens": 1000,
         }, 
-        streaming = True,
+        streaming = False,
     )
 
 # Helper
+
+def random_stage_system_promt(
+        client_names: tuple[str], 
+        incidents: tuple[str], 
+        personalities:tuple[str]
+) -> str:
+    actual_incidents:str = random.choice(incidents)
+    actual_personality:str = random.choice(personalities)
+    client_name:str = random.choice(client_names)
+
+    system_prompt:str = f"""
+    ESTÁS EN UN ROL DE SIMULACIÓN (ROLEPLAY).
+    Eres un cliente contactando a soporte TI.
+    
+    TU PERFIL:
+    - Nombre: {client_name}
+    - Incidente: {actual_incidents}
+    - Personalidad: {actual_personality}
+    
+    REGLAS DE COMPORTAMIENTO:
+    1. NO eres un asistente de IA. Eres un humano frustrado que representa a un cliente real.
+    2. Empieza la conversación muy molesto o preocupado o alterado según tu personalidad.
+    3. NO aceptes soluciones técnicas complejas de inmediato.
+    4. CRITERIO DE DESESCALADA: Solo si el agente (usuario) muestra EMPATÍA real, valida tus sentimientos Y ofrece una solución clara, bajarás el tono.
+    5. Si el agente es frío, técnico o robótico, aumenta tu molestia.
+    6. Mantén respuestas breves (como en un chat real).
+    7. Si el especialista de soporte te ofrece una solución que resuelve tu problema, aunque no sea la más técnica o avanzada, muestra agradecimiento y satisfacción, y da por resuelto el incidente.
+    8. Si comete errores de ortografia o gramática, no los corrijas, ya que eres un cliente real y eso es normal en un chat de soporte.
+    9. De vez en cuando comete errore de tipeo o escribe palabras mal, para simular un chat real de soporte.
+    10. Si el agente de soporte te ofrece una solución que no entiendes, muestra confusión y pide que te lo expliquen de otra manera, sin usar términos técnicos.
+    11. Si el agente de soporte te ofrece una solución que es claramente incorrecta o que no tiene sentido, muestra frustración y dile que eso no va a funcionar, sin ser grosero.
+    12. Si el especialista de soporte demora mucho en responder, muestra impaciencia y dile que estás esperando una respuesta, sin ser grosero.
+    13. Si recibes el mensaje INTERNO [ESPECIALISTA_INACTIVO], pregunta con impaciencia si hay alguien ahí, acorde a tu personalidad.
+    """
+
+    return system_prompt
 
 def build_langchain_messages( 
     messages: list[ChatMessage],
@@ -83,6 +144,7 @@ def build_langchain_messages(
     Convert frontend history messages to Langchain format, 
     truncate if history exceeds limits and add system prompt if provided.
     """
+
     result = [SystemMessage(content=system_prompt or SYSTEM_PROMPT)]
 
     #Truncate history if exceeds limits
@@ -99,62 +161,29 @@ def build_langchain_messages(
 
     return result
 
-async def stream_bedrock(messages: list) -> AsyncGenerator[str, None]:
-    """"
-    Generate SSE event: Send messages to Bedrock model and stream the response back as an async generator.
-    SSE format: 'data: {chunk}\n\n'
-    """
-    llm = get_llm()
-
-    try:
-        async for chunk in llm.astream(messages):
-            token = chunk.content
-            if token:
-                # Send each token with a SSE event format
-                payload = json.dumps({"token": token})
-                yield f"data: {payload}\n\n"
-                # A bit pause for no overhelm the buffer of client
-                await asyncio.sleep(0)
-
-        # Close event: The frontend knows that event close
-        yield f"data: {json.dumps({'done': True})}\n\n"
-
-    except Exception as e:
-        # In case of error, send an error event
-        error_payload = json.dumps({"error": str(e)})
-        yield f"data: {payload}\n\n"
-
-
 # Endpoints
 @app.get("/")
 def read_root():
     return {"message": "¡Hola! Esta es la API de simulación de soporte TI."}
 
-@app.post("/chat")
-def post_message(message: str):
+@app.post("/chat", response_model=ChatResponse)
+async def post_message(request: ChatRequest):
     # Process the posted message (e.g., send it to the AI model)
-    return {"message": f"Message received: {message}"}
-
-@app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """
-    Endpoint to handle chat messages and stream the AI response back to the client.
-    The frontend sends the entire chat history with each request, and optionally a custom system prompt.
-    The answer is streamed back token by token as SSE events.
-    """
     if not request.messages:
-        raise HTTPException(status_code=400, detail="No messages provided")
+        raise HTTPException(status_code=400, detail="Requeried one message")
     
-    lc_messages = build_langchain_messages(request.messages, request.system)
+    system_promt = request.system or random_stage_system_promt(client_names,incidents, personalities)
+    
+    lc_message = build_langchain_messages(request.messages, system_promt)
+    llm = get_llm()
 
-    return StreamingResponse(
-        stream_bedrock(lc_messages),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X_Accel_Buffering": "no", # Disable buffering for nginx
-        }
+    response, _ = await asyncio.gather( 
+        llm.ainvoke(lc_message),
+        asyncio.sleep(TYPING_DELAY),
     )
+
+    return ChatResponse(message=response.content)
+
 
 @app.get("/health")
 async def health():
