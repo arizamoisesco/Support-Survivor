@@ -83,6 +83,9 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     message: str
+    system: str # Pensar seriamente si quito esto because no it's necessary if the frontend to tale to endpoint yet
+
+class SessionResponse(BaseModel):
     system: str
 
 # Initialize the Bedrock model
@@ -105,6 +108,7 @@ def random_stage_system_promt(
         incidents: tuple[str], 
         personalities:tuple[str]
 ) -> str:
+    
     actual_incidents:str = random.choice(incidents)
     actual_personality:str = random.choice(personalities)
     client_name:str = random.choice(client_names)
@@ -182,7 +186,12 @@ async def post_message(request: ChatRequest):
         asyncio.sleep(TYPING_DELAY),
     )
 
-    return ChatResponse(message=response.content)
+    return ChatResponse(message=response.content, system=system_promt)
+
+@app.get("/session/new", response_model=SessionResponse)
+def new_sesion():
+    system_prompt = random_stage_system_promt(client_names,incidents, personalities)
+    return SessionResponse(system=system_prompt)
 
 
 @app.get("/health")
