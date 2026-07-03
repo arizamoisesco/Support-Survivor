@@ -29,6 +29,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
             signing_key.key,
             algorithms=["ES256", "RS256"],   # Supabase usa ES256 en proyectos nuevos
             audience="authenticated",
+            leeway=10, # Tolerancie for 10 seg with clock diference
             options={"verify_exp": True},
         )
         return payload

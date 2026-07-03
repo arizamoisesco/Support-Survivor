@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import boto3
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from langchain_aws import ChatBedrock
@@ -496,7 +497,7 @@ async def list_sessions(payload: dict = Depends(require_admin)):
     result = supabase.table("sessions")\
         .select("""
             id, status, started_at, ended_at,
-            profiles!learner_id (full_name, email, cohort),
+            profiles:learner_id (full_name, email, cohort),
             scenario_combinations (
                 client_names (name),
                 incidents (description),
@@ -507,3 +508,35 @@ async def list_sessions(payload: dict = Depends(require_admin)):
         .execute()
     return result.data
 
+@app.get("/admin/learners/template")
+async def download_learners_template(payload: dict = Depends(require_admin)):
+    """
+    Genera y descarga el archivo Excel plantilla para la carga masiva de learners.
+    Las columnas coinciden exactamente con lo que espera POST /admin/learners/bulk.
+    """
+    df = pd.DataFrame(columns=["full_name", "email", "cohort", "password"])
+ 
+    # Filas de ejemplo — el admin las borra y pone sus datos reales
+    df.loc[0] = ["Juan Pérez",  "juan.perez@generacion.org",  9, ""]
+    df.loc[1] = ["María López", "maria.lopez@generacion.org", 9, ""]
+ 
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Learners")
+ 
+        # Ajustar ancho de columnas para que se vea bien al abrir el archivo
+        worksheet = writer.sheets["Learners"]
+        worksheet.column_dimensions["A"].width = 25  # full_name
+        worksheet.column_dimensions["B"].width = 32  # email
+        worksheet.column_dimensions["C"].width = 10  # cohort
+        worksheet.column_dimensions["D"].width = 16  # password
+ 
+    buffer.seek(0)
+ 
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": "attachment; filename=plantilla_learners.xlsx"
+        },
+    )
