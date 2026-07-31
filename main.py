@@ -7,6 +7,7 @@ import io
 import random
 import secrets
 import string
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import boto3
@@ -19,11 +20,16 @@ from langchain_aws import ChatBedrock
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from auth import supabase, verify_token, require_admin, require_learner
-from db_init import init_db, SYSTEM_PROMPT_TEMPLATE
+from db_init import init_db
+import config as cfg
 
 # Configuration app
+async def lifespan(app):
+    await init_db(supabase)
+    cfg.init_config(supabase) # carga todos los configs de Supabase al arrancar
+    yield
 
-app = FastAPI(title="Soporte TI - Simulador API v2")
+app = FastAPI(title="Soporte TI - Simulador API v2", lifespan=lifespan)
 
 # Add CORS middleware
 app.add_middleware(
@@ -42,31 +48,6 @@ bedrock_client = boto3.client(
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
 )
-
-#
-# Nombres aleatorios para los clientes
-client_names = ["Carlos Martinez", "Ana García", "Luis Rodríguez", "Marta López", "Jorge Hernández", "Sofía Martínez", "Pedro González", "Lucía Sánchez"]
-
-# Bases de datos de simulacion
-incidents = [
-    "El servidor de correo no sincroniza y estoy perdiendo ventas.",
-    "La VPN me desconecta cada 10 minutos y tengo una presentación en 1 hora.",
-    "Mi pantalla se puso azul y perdí el informe trimestral no guardado."
-]
-
-personalities = [
-    "AGRESIVO: Gritas (en mayúsculas a veces), amenazas con llamar al supervisor, no entiendes razones técnicas.",
-    "ASUSTADO: Crees que te van a despedir por esto, estás en pánico, pides ayuda desesperadamente.",
-    "SARCÁSTICO: Te burlas de la competencia de TI, haces comentarios pasivo-agresivos, eres impaciente."
-]
-
-# System prompt: AI role
-SYSTEM_PROMPT = """Eres un cliente que llama a soporte técnico.
-Estás frustrado porque llevas tiempo con un problema sin resolver.
-Eres impaciente, a veces interrumpes, y a veces das información incompleta.
-Solo das más detalles cuando el agente de soporte te hace las preguntas correctas.
-Responde siempre en español. Tus respuestas son cortas, de 1-3 oraciones.
-Problema actual: No puedes acceder a tu correo corporativo desde ayer."""
 
 # Limit of history messages to keep in context
 MAX_HISTORY_TURNS = 20 # 20 for users / assistants, 40 for system messages
@@ -99,6 +80,19 @@ class SessionResponse(BaseModel):
     session_id: str
     system: str
 
+class EvaluateRequest(BaseModel):
+    session_id: str
+    messages: list[ChatMessage]
+    duration_seconds: int
+
+class EvaluationResponse(BaseModel):
+    scores: dict
+    total: float
+    feedback_positive: str
+    feedback_improve: str
+    criteria_labels: dict
+
+
 # Cataloge
 class ClientNameIn(BaseModel):
     name:str
@@ -117,6 +111,10 @@ class LearnerIn(BaseModel):
     full_name: str
     cohort: int
     password: str | None = None
+
+#Config
+class ConfigUpdate(BaseModel):
+    value: str
 
 # Initialize the Bedrock model
 def get_llm() -> ChatBedrock:
@@ -172,6 +170,14 @@ def random_stage_system_promt(
     return system_prompt
 """
 
+def get_evaluator_llm() -> ChatBedrock:
+    return ChatBedrock(
+        model_id="meta.llama3-70b-instruct-v1:0",
+        client=bedrock_client,
+        model_kwargs={"temperature": 0.1, "max_tokens": 1500},
+        streaming=False,
+    )
+
 def build_langchain_messages( 
     messages: list[ChatMessage],
     system_prompt: str
@@ -196,6 +202,13 @@ def build_langchain_messages(
             raise ValueError(f"Invalid message role: {message.role}")
 
     return result
+
+def format_conversation(messages: list[ChatMessage]) -> str:
+    lines = []
+    for msg in messages:
+        role = "ESPECIALISTA" if msg.role == "user" else "CLIENTE"
+        lines.append(f"{role}: {msg.content}")
+    return "\n".join(lines)
 
 def generate_password(length: int = 12) -> str:
     chars = string.ascii_letters + string.digits + "!@#$"
@@ -231,72 +244,112 @@ async def health():
 # Learner: Start practice session
 @app.post("/session/new", response_model=SessionResponse)
 async def new_session(payload: dict = Depends(require_learner)):
-    learner_id = payload["sub"]
+    learner_id   = payload["sub"]
+    timer_seconds = cfg.get_int("session_timer_seconds", 180)
  
-    # Combinaciones que el learner ya usó
-    usadas = supabase.table("scenario_combinations")\
-        .select("client_name_id, incident_id, personality_id")\
+    # Priorizar scenarios narrativos no vistos
+    vistos = supabase.table("sessions")\
+        .select("scenario_id")\
         .eq("learner_id", learner_id)\
+        .eq("session_type", "scenario")\
+        .not_.is_("scenario_id", "null")\
         .execute()
  
-    usadas_set = {
-        (r["client_name_id"], r["incident_id"], r["personality_id"])
-        for r in (usadas.data or [])
-    }
+    ids_vistos = [s["scenario_id"] for s in (vistos.data or []) if s["scenario_id"]]
+    query = supabase.table("scenarios").select("*").eq("active", True)
+    if ids_vistos:
+        query = query.not_.in_("id", ids_vistos)
  
-    # Cargar catálogos activos
-    names   = supabase.table("client_names").select("*").eq("active", True).execute().data
-    incs    = supabase.table("incidents").select("*").eq("active", True).execute().data
-    pers    = supabase.table("personalities").select("*").eq("active", True).execute().data
+    narrativos = query.execute()
  
-    if not names or not incs or not pers:
-        raise HTTPException(status_code=500, detail="Los catálogos están vacíos. Contacta al administrador.")
+    if narrativos.data:
+        escenario = random.choice(narrativos.data)
+        session = supabase.table("sessions").insert({
+            "learner_id":     learner_id,
+            "scenario_id":    escenario["id"],
+            "combination_id": None,
+            "system_prompt":  escenario["system_prompt"],
+            "session_type":   "scenario",
+            "status":         "active",
+            "timer_seconds":  timer_seconds,
+        }).execute()
  
-    # Generar todas las combinaciones posibles no usadas
+        return SessionResponse(
+            session_id=session.data[0]["id"],
+            system=escenario["system_prompt"],
+            timer_seconds=timer_seconds,
+            session_type="scenario",
+        )
+ 
+    # Fallback a combinaciones aleatorias del catálogo
+    usadas = supabase.table("scenario_combinations")\
+        .select("client_name_id, incident_id, personality_id")\
+        .eq("learner_id", learner_id).execute()
+ 
+    usadas_set = {(r["client_name_id"], r["incident_id"], r["personality_id"])
+                  for r in (usadas.data or [])}
+ 
+    names = supabase.table("client_names").select("*").eq("active", True).execute().data
+    incs  = supabase.table("incidents").select("*").eq("active", True).execute().data
+    pers  = supabase.table("personalities").select("*").eq("active", True).execute().data
+ 
     disponibles = [
-        (n, i, p)
-        for n in names for i in incs for p in pers
+        (n, i, p) for n in names for i in incs for p in pers
         if (n["id"], i["id"], p["id"]) not in usadas_set
     ]
  
     if not disponibles:
-        raise HTTPException(
-            status_code=404,
-            detail="Ya practicaste todas las combinaciones disponibles. ¡Bien hecho!"
-        )
+        raise HTTPException(status_code=404,
+            detail="Ya practicaste todos los casos disponibles. ¡Felicitaciones!")
  
-    # Elegir una combinación al azar
     name, inc, per = random.choice(disponibles)
  
-    # Armar el system prompt con la plantilla
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        client_name=name["name"],
-        incident=inc["description"],
-        personality_name=per["name"],
-        personality_description=per["description"],
+    system_prompt = (
+        f"ESTÁS EN UN ROL DE SIMULACIÓN (ROLEPLAY).\n"
+        f"Eres un cliente contactando a soporte TI.\n\n"
+        f"TU PERFIL:\n"
+        f"- Nombre: {name['name']}\n"
+        f"- Incidente: {inc['description']}\n"
+        f"- Personalidad: {per['name']} — {per['description']}\n\n"
+        f"REGLAS DE COMPORTAMIENTO:\n"
+        f"1. NO eres un asistente de IA. Eres un humano frustrado representando a un cliente real.\n"
+        f"2. Empieza la conversación muy molesto, asustado o alterado según tu personalidad.\n"
+        f"3. NO aceptes soluciones técnicas complejas de inmediato.\n"
+        f"4. Solo baja el tono si el agente muestra EMPATÍA real y ofrece solución clara.\n"
+        f"5. Si el agente es frío o robótico, aumenta tu molestia.\n"
+        f"6. Respuestas breves, 1-3 oraciones máximo.\n"
+        f"7. Si el especialista resuelve tu problema, muestra agradecimiento.\n"
+        f"8. No corrijas errores de ortografía del agente.\n"
+        f"9. De vez en cuando comete errores de tipeo para simular un chat real.\n"
+        f"10. Si no entiendes algo técnico, pide explicación simple.\n"
+        f"Responde siempre en español."
     )
  
-    # Registrar la combinación como usada
     combo = supabase.table("scenario_combinations").insert({
-        "learner_id":      learner_id,
-        "client_name_id":  name["id"],
-        "incident_id":     inc["id"],
-        "personality_id":  per["id"],
+        "learner_id":     learner_id,
+        "client_name_id": name["id"],
+        "incident_id":    inc["id"],
+        "personality_id": per["id"],
     }).execute()
  
-    # Crear sesión
     session = supabase.table("sessions").insert({
         "learner_id":     learner_id,
         "combination_id": combo.data[0]["id"],
+        "scenario_id":    None,
         "system_prompt":  system_prompt,
+        "session_type":   "combination",
         "status":         "active",
+        "timer_seconds":  timer_seconds,
     }).execute()
  
     return SessionResponse(
         session_id=session.data[0]["id"],
         system=system_prompt,
+        timer_seconds=timer_seconds,
+        session_type="combination",
     )
-
+ 
+ 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, payload: dict = Depends(require_learner)):
     if not request.messages:
@@ -311,130 +364,194 @@ async def chat(request: ChatRequest, payload: dict = Depends(require_learner)):
     )
  
     content = response.content
- 
-    ultimo = request.messages[-1]
+    ultimo  = request.messages[-1]
     supabase.table("messages").insert([
         {"session_id": request.session_id, "role": "user",      "content": ultimo.content},
         {"session_id": request.session_id, "role": "assistant", "content": content},
     ]).execute()
  
     return ChatResponse(message=content)
-
-
-@app.patch("/session/{session_id}/complete")
-async def complete_session(session_id: str, payload: dict = Depends(require_learner)):
-    supabase.table("sessions").update({
-        "status":   "completed",
-        "ended_at": datetime.now(timezone.utc).isoformat(),
-        "revealed": True,
-    }).eq("id", session_id).execute()
  
-    # Traer datos de la combinación para revelar al learner
-    sesion = supabase.table("sessions")\
-        .select("""
-            combination_id,
-            scenario_combinations (
-                client_names (name),
-                incidents (description, category),
-                personalities (name, description)
-            )
-        """)\
-        .eq("id", session_id)\
+ 
+@app.post("/session/evaluate", response_model=EvaluationResponse)
+async def evaluate_session(request: EvaluateRequest, payload: dict = Depends(require_learner)):
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="No hay mensajes para evaluar")
+ 
+    # Leer prompt de evaluación desde Supabase (ya en cache)
+    eval_prompt_template = cfg.get("evaluation_prompt")
+    if not eval_prompt_template:
+        raise HTTPException(status_code=500,
+            detail="Prompt de evaluación no configurado. Contacta al administrador.")
+ 
+    # Contexto del escenario para el evaluador
+    session_data = supabase.table("sessions")\
+        .select("system_prompt")\
+        .eq("id", request.session_id)\
         .single().execute()
  
-    combo = sesion.data.get("scenario_combinations", {})
-    return {
-        "revealed": {
-            "client_name": combo.get("client_names", {}).get("name"),
-            "incident":    combo.get("incidents", {}).get("description"),
-            "category":    combo.get("incidents", {}).get("category"),
-            "personality": combo.get("personalities", {}).get("name"),
-        }
-    }
-
-# Admin: user administration
-
+    system_prompt    = session_data.data.get("system_prompt", "")
+    scenario_context = f"Perfil del cliente simulado:\n{system_prompt[:800]}"
+    conversation     = format_conversation(request.messages)
+ 
+    eval_prompt = eval_prompt_template.format(
+        scenario_context=scenario_context,
+        conversation=conversation,
+    )
+ 
+    llm = get_evaluator_llm()
+ 
+    try:
+        response = await asyncio.to_thread(
+            llm.invoke, [HumanMessage(content=eval_prompt)]
+        )
+        import json
+        content = response.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        result = json.loads(content.strip())
+ 
+    except Exception as e:
+        raise HTTPException(status_code=500,
+            detail=f"Error al generar la evaluación: {str(e)}")
+ 
+    # Guardar en Supabase
+    try:
+        supabase.table("evaluations").upsert({
+            "session_id":        request.session_id,
+            "criteria_scores":   result["scores"],
+            "total_score":       int(float(result["total"])),
+            "feedback_positive": result["feedback_positive"],
+            "feedback_improve":  result["feedback_improve"],
+        }).execute()
+ 
+        supabase.table("sessions").update({
+            "status":           "completed",
+            "ended_at":         datetime.now(timezone.utc).isoformat(),
+            "revealed":         True,
+            "duration_seconds": request.duration_seconds,
+        }).eq("id", request.session_id).execute()
+ 
+    except Exception:
+        pass
+ 
+    # Leer labels de criterios desde Supabase
+    criteria_labels = cfg.get_json("criteria_labels", {
+        "ciclo_gestion":            "Ciclo de gestión de incidencias",
+        "lenguaje_positivo":        "Lenguaje positivo y profesional",
+        "reconocimiento_emociones": "Reconocimiento de emociones",
+        "adaptacion_perfil":        "Adaptación al perfil del cliente",
+        "estructura_conversacion":  "Estructura de la conversación",
+        "claridad_concision":       "Claridad y concisión",
+        "gramatica_ortografia":     "Gramática y ortografía",
+    })
+ 
+    return EvaluationResponse(
+        scores=result["scores"],
+        total=float(result["total"]),
+        feedback_positive=result["feedback_positive"],
+        feedback_improve=result["feedback_improve"],
+        criteria_labels=criteria_labels,
+    )
+ 
+ 
+# ── Admin: configuraciones ─────────────────────────────────────────────────────
+ 
+@app.get("/admin/config")
+async def list_configs(payload: dict = Depends(require_admin)):
+    """Lista todas las configuraciones del sistema."""
+    return supabase.table("system_configs").select("*").order("key").execute().data
+ 
+@app.patch("/admin/config/{key}")
+async def update_config(key: str, update: ConfigUpdate, payload: dict = Depends(require_admin)):
+    """Actualiza una configuración y recarga el cache automáticamente."""
+    result = supabase.table("system_configs")\
+        .update({"value": update.value})\
+        .eq("key", key).execute()
+ 
+    if not result.data:
+        raise HTTPException(status_code=404, detail=f"Configuración '{key}' no encontrada")
+ 
+    # Recargar cache para que el cambio sea inmediato
+    cfg.reload_config(supabase)
+ 
+    return result.data[0]
+ 
+@app.post("/admin/config/reload")
+async def reload_configs(payload: dict = Depends(require_admin)):
+    """Fuerza recarga del cache de configuraciones."""
+    cfg.reload_config(supabase)
+    return {"message": "Configuraciones recargadas", "keys": list(cfg._cache.keys())}
+ 
+ 
+# ── Admin: usuarios ────────────────────────────────────────────────────────────
+ 
 @app.post("/admin/learners")
 async def create_learner(learner: LearnerIn, payload: dict = Depends(require_admin)):
-    """Crear un solo learner."""
-    result = await create_learner_account(learner)
-    return result
- 
+    return await create_learner_account(learner)
  
 @app.post("/admin/learners/bulk")
-async def create_learners_bulk(
-    file: UploadFile = File(...),
-    payload: dict = Depends(require_admin)
-):
-    """
-    Crear múltiples learners desde un archivo Excel.
-    Columnas requeridas: full_name, email, cohort
-    Columna opcional:    password (si no está, se genera automáticamente)
- 
-    El admin descarga el resultado con emails y contraseñas generadas.
-    """
+async def create_learners_bulk(file: UploadFile = File(...), payload: dict = Depends(require_admin)):
     if not file.filename.endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="Solo se aceptan archivos .xlsx o .xls")
- 
+        raise HTTPException(status_code=400, detail="Solo se aceptan .xlsx o .xls")
     contents = await file.read()
     try:
         df = pd.read_excel(io.BytesIO(contents))
     except Exception:
         raise HTTPException(status_code=400, detail="No se pudo leer el archivo Excel")
- 
-    # Validar columnas requeridas
     required = {"full_name", "email", "cohort"}
     missing  = required - set(df.columns.str.lower())
     if missing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Columnas faltantes en el Excel: {', '.join(missing)}"
-        )
- 
+        raise HTTPException(status_code=400, detail=f"Columnas faltantes: {', '.join(missing)}")
     df.columns = df.columns.str.lower()
- 
     results = []
     for _, row in df.iterrows():
         learner = LearnerIn(
             email=str(row["email"]).strip(),
             full_name=str(row["full_name"]).strip(),
             cohort=int(row["cohort"]),
-            password=str(row["password"]).strip() if "password" in df.columns and pd.notna(row.get("password")) else None,
+            password=str(row["password"]).strip()
+                if "password" in df.columns and pd.notna(row.get("password")) else None,
         )
-        result = await create_learner_account(learner)
-        results.append(result)
- 
+        results.append(await create_learner_account(learner))
     created = [r for r in results if r["status"] == "created"]
     failed  = [r for r in results if r["status"] == "failed"]
+    return {"total": len(results), "created": len(created), "failed": len(failed), "results": results}
  
-    return {
-        "total":   len(results),
-        "created": len(created),
-        "failed":  len(failed),
-        "results": results,   # incluye contraseñas generadas — guardar antes de cerrar
-    }
- 
+@app.get("/admin/learners/template")
+async def download_template(payload: dict = Depends(require_admin)):
+    df = pd.DataFrame(columns=["full_name", "email", "cohort", "password"])
+    df.loc[0] = ["Juan Pérez",  "juan.perez@empresa.com",  9, ""]
+    df.loc[1] = ["María López", "maria.lopez@empresa.com", 9, ""]
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Learners")
+        ws = writer.sheets["Learners"]
+        ws.column_dimensions["A"].width = 25
+        ws.column_dimensions["B"].width = 32
+        ws.column_dimensions["C"].width = 10
+        ws.column_dimensions["D"].width = 16
+    buffer.seek(0)
+    return StreamingResponse(buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=plantilla_learners.xlsx"})
  
 @app.get("/admin/learners")
 async def list_learners(payload: dict = Depends(require_admin)):
-    result = supabase.table("profiles")\
+    return supabase.table("profiles")\
         .select("id, email, full_name, cohort, active, created_at")\
-        .eq("role", "learner")\
-        .order("cohort", desc=True)\
-        .order("full_name")\
-        .execute()
-    return result.data
- 
+        .eq("role", "learner").order("cohort", desc=True).order("full_name").execute().data
  
 @app.patch("/admin/learners/{learner_id}")
 async def update_learner(learner_id: str, updates: dict, payload: dict = Depends(require_admin)):
-    allowed = {"full_name", "cohort", "active"}
+    allowed  = {"full_name", "cohort", "active"}
     filtered = {k: v for k, v in updates.items() if k in allowed}
-    result = supabase.table("profiles").update(filtered).eq("id", learner_id).execute()
-    return result.data[0]
+    return supabase.table("profiles").update(filtered).eq("id", learner_id).execute().data[0]
  
  
-# ── Admin: gestión de catálogos ───────────────────────────────────────────────
+# ── Admin: catálogos ───────────────────────────────────────────────────────────
  
 @app.get("/admin/catalog/names")
 async def list_names(payload: dict = Depends(require_admin)):
@@ -442,16 +559,13 @@ async def list_names(payload: dict = Depends(require_admin)):
  
 @app.post("/admin/catalog/names")
 async def add_name(item: ClientNameIn, payload: dict = Depends(require_admin)):
-    result = supabase.table("client_names").insert({
-        "name": item.name, "created_by": payload["sub"]
-    }).execute()
-    return result.data[0]
+    return supabase.table("client_names")\
+        .insert({"name": item.name, "created_by": payload["sub"]}).execute().data[0]
  
 @app.patch("/admin/catalog/names/{item_id}")
 async def toggle_name(item_id: str, updates: dict, payload: dict = Depends(require_admin)):
-    result = supabase.table("client_names").update({"active": updates.get("active", True)}).eq("id", item_id).execute()
-    return result.data[0]
- 
+    return supabase.table("client_names")\
+        .update({"active": updates.get("active", True)}).eq("id", item_id).execute().data[0]
  
 @app.get("/admin/catalog/incidents")
 async def list_incidents(payload: dict = Depends(require_admin)):
@@ -459,18 +573,15 @@ async def list_incidents(payload: dict = Depends(require_admin)):
  
 @app.post("/admin/catalog/incidents")
 async def add_incident(item: IncidentIn, payload: dict = Depends(require_admin)):
-    result = supabase.table("incidents").insert({
-        "description": item.description,
-        "category":    item.category,
-        "created_by":  payload["sub"],
-    }).execute()
-    return result.data[0]
+    return supabase.table("incidents").insert({
+        "description": item.description, "category": item.category,
+        "created_by": payload["sub"]
+    }).execute().data[0]
  
 @app.patch("/admin/catalog/incidents/{item_id}")
 async def toggle_incident(item_id: str, updates: dict, payload: dict = Depends(require_admin)):
-    result = supabase.table("incidents").update({"active": updates.get("active", True)}).eq("id", item_id).execute()
-    return result.data[0]
- 
+    return supabase.table("incidents")\
+        .update({"active": updates.get("active", True)}).eq("id", item_id).execute().data[0]
  
 @app.get("/admin/catalog/personalities")
 async def list_personalities(payload: dict = Depends(require_admin)):
@@ -478,65 +589,48 @@ async def list_personalities(payload: dict = Depends(require_admin)):
  
 @app.post("/admin/catalog/personalities")
 async def add_personality(item: PersonalityIn, payload: dict = Depends(require_admin)):
-    result = supabase.table("personalities").insert({
-        "name":        item.name,
-        "description": item.description,
-        "created_by":  payload["sub"],
-    }).execute()
-    return result.data[0]
+    return supabase.table("personalities").insert({
+        "name": item.name, "description": item.description,
+        "created_by": payload["sub"]
+    }).execute().data[0]
  
 @app.patch("/admin/catalog/personalities/{item_id}")
 async def toggle_personality(item_id: str, updates: dict, payload: dict = Depends(require_admin)):
-    result = supabase.table("personalities").update({"active": updates.get("active", True)}).eq("id", item_id).execute()
-    return result.data[0]
-
-# Admin:Reports
-
+    return supabase.table("personalities")\
+        .update({"active": updates.get("active", True)}).eq("id", item_id).execute().data[0]
+ 
+ 
+# ── Admin: scenarios narrativos ────────────────────────────────────────────────
+ 
+@app.get("/admin/scenarios")
+async def list_scenarios(payload: dict = Depends(require_admin)):
+    return supabase.table("scenarios").select("*").order("created_at", desc=True).execute().data
+ 
+@app.post("/admin/scenarios")
+async def create_scenario(scenario: dict, payload: dict = Depends(require_admin)):
+    scenario["created_by"] = payload["sub"]
+    return supabase.table("scenarios").insert(scenario).execute().data[0]
+ 
+@app.patch("/admin/scenarios/{scenario_id}")
+async def update_scenario(scenario_id: str, updates: dict, payload: dict = Depends(require_admin)):
+    return supabase.table("scenarios").update(updates).eq("id", scenario_id).execute().data[0]
+ 
+ 
+# ── Admin: reportes ────────────────────────────────────────────────────────────
+ 
 @app.get("/admin/sessions")
 async def list_sessions(payload: dict = Depends(require_admin)):
-    result = supabase.table("sessions")\
+    return supabase.table("sessions")\
         .select("""
-            id, status, started_at, ended_at,
+            id, status, session_type, started_at, ended_at, duration_seconds, timer_seconds,
             profiles:learner_id (full_name, email, cohort),
+            evaluations (total_score, criteria_scores, feedback_positive, feedback_improve),
             scenario_combinations (
                 client_names (name),
                 incidents (description),
                 personalities (name)
-            )
+            ),
+            scenarios (title, difficulty)
         """)\
-        .order("started_at", desc=True)\
-        .execute()
-    return result.data
-
-@app.get("/admin/learners/template")
-async def download_learners_template(payload: dict = Depends(require_admin)):
-    """
-    Genera y descarga el archivo Excel plantilla para la carga masiva de learners.
-    Las columnas coinciden exactamente con lo que espera POST /admin/learners/bulk.
-    """
-    df = pd.DataFrame(columns=["full_name", "email", "cohort", "password"])
+        .order("started_at", desc=True).execute().data
  
-    # Filas de ejemplo — el admin las borra y pone sus datos reales
-    df.loc[0] = ["Juan Pérez",  "juan.perez@generacion.org",  9, ""]
-    df.loc[1] = ["María López", "maria.lopez@generacion.org", 9, ""]
- 
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Learners")
- 
-        # Ajustar ancho de columnas para que se vea bien al abrir el archivo
-        worksheet = writer.sheets["Learners"]
-        worksheet.column_dimensions["A"].width = 25  # full_name
-        worksheet.column_dimensions["B"].width = 32  # email
-        worksheet.column_dimensions["C"].width = 10  # cohort
-        worksheet.column_dimensions["D"].width = 16  # password
- 
-    buffer.seek(0)
- 
-    return StreamingResponse(
-        buffer,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": "attachment; filename=plantilla_learners.xlsx"
-        },
-    )
