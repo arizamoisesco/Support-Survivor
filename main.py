@@ -634,3 +634,12 @@ async def list_sessions(payload: dict = Depends(require_admin)):
         """)\
         .order("started_at", desc=True).execute().data
  
+
+@app.get("/admin/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str, payload: dict = Depends(require_admin)):
+    result = supabase.table("messages")\
+        .select("role, content, created_at")\
+        .eq("session_id", session_id)\
+        .order("created_at")\
+        .execute()
+    return result.data
