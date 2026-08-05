@@ -245,6 +245,19 @@ async def health():
 @app.post("/session/new", response_model=SessionResponse)
 async def new_session(payload: dict = Depends(require_learner)):
     learner_id   = payload["sub"]
+
+    # Bloquear acceso si el perfil está desactivado
+    profile = supabase.table("profiles")\
+    .select("active")\
+    .eq("id", learner_id)\
+    .single().execute()
+
+    if not profile.data or not profile.data.get("active", True):
+        raise HTTPException(
+            status_code=403,
+            detail="Tu acceso está desactivado. Contacta a tu instructor."
+        )
+
     timer_seconds = cfg.get_int("session_timer_seconds", 180)
  
     # Priorizar scenarios narrativos no vistos
