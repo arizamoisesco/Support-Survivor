@@ -34,7 +34,7 @@ app = FastAPI(title="Soporte TI - Simulador API v2", lifespan=lifespan)
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://main.d1cutcgdr87tup.amplifyapp.com"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "support-survivor-frontend.vercel.app"],
     #allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
